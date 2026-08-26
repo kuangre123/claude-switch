@@ -1,0 +1,5 @@
+.build/
+.buildnative/
+dist/
+.DS_Store
+*.xcodeproj/
