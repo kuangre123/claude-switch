@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum ClaudeDesktopSessionMirrorError: LocalizedError {
@@ -36,24 +37,30 @@ public struct ClaudeDesktopSessionIndexMirror: Sendable {
 
     public struct Summary: Sendable, Equatable {
         public var imported: Int
+        public var refreshed: Int
         public var alreadyPresent: Int
         public var missingTranscript: Int
         public var archivedOrDeleted: Int
+        public var unreadable: Int
 
         public init(
             imported: Int = 0,
+            refreshed: Int = 0,
             alreadyPresent: Int = 0,
             missingTranscript: Int = 0,
-            archivedOrDeleted: Int = 0
+            archivedOrDeleted: Int = 0,
+            unreadable: Int = 0
         ) {
             self.imported = imported
+            self.refreshed = refreshed
             self.alreadyPresent = alreadyPresent
             self.missingTranscript = missingTranscript
             self.archivedOrDeleted = archivedOrDeleted
+            self.unreadable = unreadable
         }
 
         public var examined: Int {
-            imported + alreadyPresent + missingTranscript + archivedOrDeleted
+            imported + refreshed + alreadyPresent + missingTranscript + archivedOrDeleted + unreadable
         }
     }
 
@@ -93,80 +100,40 @@ public struct ClaudeDesktopSessionIndexMirror: Sendable {
 extension ClaudeDesktopSessionIndexMirror {
     /// Copies eligible first-party index records into the third-party space.
     ///
-    /// Skips records that are archived, tombstoned, already imported, or whose
-    /// transcript no longer exists in `~/.claude/projects`, so the sidebar does
-    /// not fill up with entries that cannot be opened.
+    /// Only the sidebar timestamp is refreshed on existing copies we imported.
     @discardableResult
     public func importOfficialSessions() throws -> Summary {
-        guard let destination = try thirdPartyIndexDirectory() else {
-            throw ClaudeDesktopSessionMirrorError.missingThirdPartyAccount
-        }
-
-        let transcripts = availableTranscriptIDs()
-        var summary = Summary()
-        var imported: [String] = []
-
-        for source in try officialIndexDirectories() {
-            let tombstoned = tombstonedSessionIDs(in: source)
-            for record in try recordURLs(in: source) {
-                let sessionID = sessionID(for: record)
-                if tombstoned.contains(sessionID) {
-                    summary.archivedOrDeleted += 1
-                    continue
-                }
-
-                let target = destination.appendingPathComponent(
-                    record.lastPathComponent,
-                    isDirectory: false
-                )
-                if FileManager.default.fileExists(atPath: target.path) {
-                    summary.alreadyPresent += 1
-                    continue
-                }
-
-                let object = try readRecord(at: record)
-                if object["isArchived"] as? Bool == true {
-                    summary.archivedOrDeleted += 1
-                    continue
-                }
-                guard let cliSessionID = object["cliSessionId"] as? String,
-                      transcripts.contains(cliSessionID) else {
-                    summary.missingTranscript += 1
-                    continue
-                }
-
-                try write(object, to: target)
-                imported.append(record.lastPathComponent)
-                summary.imported += 1
-            }
-        }
-
-        if !imported.isEmpty {
-            try recordImportState(adding: imported)
-        }
-        return summary
+        try withImportLock { try scan(preview: false) }
     }
 
     /// Removes only the records this mirror previously copied, leaving
     /// conversations that started in third-party mode untouched.
     @discardableResult
     public func removeImportedSessions() throws -> Int {
-        guard let destination = try thirdPartyIndexDirectory(createIfMissing: false),
-              let state = try readImportState() else {
-            return 0
-        }
-
-        var removed = 0
-        for name in state.importedRecordNames {
-            let url = destination.appendingPathComponent(name, isDirectory: false)
-            guard FileManager.default.fileExists(atPath: url.path) else {
-                continue
+        try withImportLock {
+            guard let destination = try thirdPartyIndexDirectory(createIfMissing: false) else { return 0 }
+            var state = try readImportState()
+            let key = destinationKey(destination)
+            guard let names = state.recordsByDestination[key] else { return 0 }
+            var removed = 0
+            for name in names {
+                guard name.hasPrefix(Self.recordPrefix), name.hasSuffix(".json"), !name.contains("/") else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                let url = destination.appendingPathComponent(name, isDirectory: false)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    try FileManager.default.removeItem(at: url)
+                    removed += 1
+                }
             }
-            try FileManager.default.removeItem(at: url)
-            removed += 1
+            state.recordsByDestination.removeValue(forKey: key)
+            if state.recordsByDestination.isEmpty && state.unassignedLegacyRecords.isEmpty {
+                try removeImportState()
+            } else {
+                try writeImportState(state)
+            }
+            return removed
         }
-        try removeImportState()
-        return removed
     }
 
     /// Whether any first-party record is eligible to import right now.
@@ -174,34 +141,44 @@ extension ClaudeDesktopSessionIndexMirror {
         guard let summary = try? previewImportableSessions() else {
             return false
         }
-        return summary.imported > 0
+        return summary.imported > 0 || summary.refreshed > 0
     }
 
     /// Counts what an import would do without writing anything.
     public func previewImportableSessions() throws -> Summary {
-        let destination = try? thirdPartyIndexDirectory(createIfMissing: false)
+        try scan(preview: true)
+    }
+}
+private extension ClaudeDesktopSessionIndexMirror {
+    func scan(preview: Bool) throws -> Summary {
+        let destination = try thirdPartyIndexDirectory(createIfMissing: !preview)
+        if !preview && destination == nil {
+            throw ClaudeDesktopSessionMirrorError.missingThirdPartyAccount
+        }
+        var state = try readImportState()
+        let key = destination.map(destinationKey)
+        let tracked = key.flatMap { state.recordsByDestination[$0] } ?? []
+        let destinationTombstones = destination.map(tombstonedSessionIDs(in:)) ?? []
         let transcripts = availableTranscriptIDs()
         var summary = Summary()
 
         for source in try officialIndexDirectories() {
-            let tombstoned = tombstonedSessionIDs(in: source)
+            let tombstoned = destinationTombstones.union(tombstonedSessionIDs(in: source))
             for record in try recordURLs(in: source) {
                 let sessionID = sessionID(for: record)
                 if tombstoned.contains(sessionID) {
                     summary.archivedOrDeleted += 1
                     continue
                 }
-                if let destination,
-                   FileManager.default.fileExists(
-                       atPath: destination
-                           .appendingPathComponent(record.lastPathComponent)
-                           .path
-                   ) {
+                let name = record.lastPathComponent
+                let target = destination?.appendingPathComponent(name)
+                let exists = target.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+                if exists && !tracked.contains(name) {
                     summary.alreadyPresent += 1
                     continue
                 }
                 guard let object = try? readRecord(at: record) else {
-                    summary.missingTranscript += 1
+                    summary.unreadable += 1
                     continue
                 }
                 if object["isArchived"] as? Bool == true {
@@ -213,15 +190,45 @@ extension ClaudeDesktopSessionIndexMirror {
                     summary.missingTranscript += 1
                     continue
                 }
-                summary.imported += 1
+                if exists, let target {
+                    guard var local = try? readRecord(at: target) else {
+                        summary.unreadable += 1
+                        continue
+                    }
+                    guard local["isArchived"] as? Bool != true,
+                          local["cliSessionId"] as? String == cliSessionID,
+                          let sourceActivity = object["lastActivityAt"] as? Int64,
+                          sourceActivity > (local["lastActivityAt"] as? Int64 ?? 0) else {
+                        summary.alreadyPresent += 1
+                        continue
+                    }
+                    if !preview {
+                        local["lastActivityAt"] = sourceActivity
+                        try atomicWrite(try JSONSerialization.data(withJSONObject: local), to: target)
+                    }
+                    summary.refreshed += 1
+                } else if preview {
+                    summary.imported += 1
+                } else if let target, let key, try writeNewRecord(object, to: target) {
+                    state.recordsByDestination[key, default: []].insert(name)
+                    do {
+                        try writeImportState(state)
+                    } catch {
+                        try FileManager.default.removeItem(at: target)
+                        throw error
+                    }
+                    summary.imported += 1
+                } else {
+                    summary.alreadyPresent += 1
+                }
             }
         }
         return summary
     }
-}
-private extension ClaudeDesktopSessionIndexMirror {
+
     struct ImportState: Codable {
-        var importedRecordNames: [String]
+        var recordsByDestination: [String: Set<String>] = [:]
+        var unassignedLegacyRecords: Set<String> = []
     }
 
     var officialSessionsRootURL: URL {
@@ -248,7 +255,7 @@ private extension ClaudeDesktopSessionIndexMirror {
               let object = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any],
               let accountID = object["lastKnownAccountUuid"] as? String,
-              !accountID.isEmpty else {
+              UUID(uuidString: accountID) != nil else {
             return nil
         }
         return accountID
@@ -276,7 +283,18 @@ private extension ClaudeDesktopSessionIndexMirror {
     }
 
     func thirdPartyIndexDirectory(createIfMissing: Bool = true) throws -> URL? {
-        guard let accountID = accountID(for: thirdPartyRootURL) else {
+        // Static gateway mode uses the device identity. Older installs may
+        // only have the account UUID cached by Desktop in config.json.
+        let deviceIDFile = thirdPartyRootURL.appendingPathComponent("ant-did")
+        let accountID: String?
+        if FileManager.default.fileExists(atPath: deviceIDFile.path) {
+            let encoded = try String(contentsOf: deviceIDFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            accountID = Data(base64Encoded: encoded).flatMap { String(data: $0, encoding: .utf8) }
+        } else {
+            accountID = self.accountID(for: thirdPartyRootURL)
+        }
+        guard let accountID, UUID(uuidString: accountID) != nil else {
             return nil
         }
         let accountDirectory = thirdPartySessionsRootURL.appendingPathComponent(
@@ -284,30 +302,35 @@ private extension ClaudeDesktopSessionIndexMirror {
             isDirectory: true
         )
 
-        let existing = (try? FileManager.default.contentsOfDirectory(
-            at: accountDirectory,
-            includingPropertiesForKeys: [.isDirectoryKey]
-        ))?.filter {
-            (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
-
-        if let directory = existing?.first {
-            return directory
-        }
-        guard createIfMissing else {
-            return nil
-        }
-
-        let placeholder = accountDirectory.appendingPathComponent(
-            Self.placeholderOrganizationID,
+        let directory = accountDirectory.appendingPathComponent(
+            try thirdPartyOrganizationID(),
             isDirectory: true
         )
+        guard createIfMissing else {
+            return FileManager.default.fileExists(atPath: directory.path) ? directory : nil
+        }
         try FileManager.default.createDirectory(
-            at: placeholder,
+            at: directory,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        return placeholder
+        return directory
+    }
+
+    func thirdPartyOrganizationID() throws -> String {
+        struct Selection: Decodable { var appliedId: String? }
+        struct Deployment: Decodable { var deploymentOrganizationUuid: String? }
+        let library = thirdPartyRootURL.appendingPathComponent("configLibrary")
+        let meta = library.appendingPathComponent("_meta.json")
+        guard FileManager.default.fileExists(atPath: meta.path) else { return Self.placeholderOrganizationID }
+        let selection = try JSONDecoder().decode(Selection.self, from: Data(contentsOf: meta))
+        guard let id = selection.appliedId else { return Self.placeholderOrganizationID }
+        guard UUID(uuidString: id) != nil else { throw CocoaError(.fileReadCorruptFile) }
+        let profile = library.appendingPathComponent(id + ".json")
+        let deployment = try JSONDecoder().decode(Deployment.self, from: Data(contentsOf: profile))
+        guard let org = deployment.deploymentOrganizationUuid else { return Self.placeholderOrganizationID }
+        guard UUID(uuidString: org) != nil else { throw CocoaError(.fileReadCorruptFile) }
+        return org
     }
 
     func recordURLs(in directory: URL) throws -> [URL] {
@@ -381,12 +404,25 @@ private extension ClaudeDesktopSessionIndexMirror {
         return object
     }
 
-    func write(_ object: [String: Any], to url: URL) throws {
+    /// Publish the complete record only if Desktop hasn't created it in the meantime.
+    func writeNewRecord(_ object: [String: Any], to url: URL) throws -> Bool {
         let data = try JSONSerialization.data(
             withJSONObject: object,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         ) + Data([0x0A])
-        try atomicWrite(data, to: url)
+        var template = Array((url.deletingLastPathComponent().path + "/.claude-switch.XXXXXX").utf8CString)
+        let descriptor = mkstemp(&template)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let stagedPath = template.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+        defer { _ = unlink(stagedPath) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        try handle.write(contentsOf: data)
+        try handle.close()
+        guard renamex_np(stagedPath, url.path, UInt32(RENAME_EXCL)) == 0 else {
+            if errno == EEXIST { return false }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return true
     }
 
     func atomicWrite(_ data: Data, to url: URL) throws {
@@ -402,25 +438,56 @@ private extension ClaudeDesktopSessionIndexMirror {
         )
     }
 
-    func readImportState() throws -> ImportState? {
-        guard FileManager.default.fileExists(atPath: importStateURL.path) else {
-            return nil
-        }
-        return try JSONDecoder().decode(
-            ImportState.self,
-            from: Data(contentsOf: importStateURL)
-        )
+    func destinationKey(_ directory: URL) -> String {
+        directory.deletingLastPathComponent().lastPathComponent + "/" + directory.lastPathComponent
     }
 
-    func recordImportState(adding names: [String]) throws {
-        var merged = (try? readImportState())??.importedRecordNames ?? []
-        merged.append(contentsOf: names)
-        let state = ImportState(importedRecordNames: Array(Set(merged)).sorted())
+    func readImportState() throws -> ImportState {
+        guard FileManager.default.fileExists(atPath: importStateURL.path) else {
+            return ImportState()
+        }
+        let data = try Data(contentsOf: importStateURL)
+        let decoder = JSONDecoder()
+        if let state = try? decoder.decode(ImportState.self, from: data) { return state }
+        // v1.4 stored only filenames. Claim those records only when there is
+        // exactly one possible third-party account and organization on disk.
+        struct Legacy: Decodable { var importedRecordNames: Set<String> }
+        let old = try decoder.decode(Legacy.self, from: data)
+        func uuidDirectories(_ root: URL) throws -> [URL] {
+            guard FileManager.default.fileExists(atPath: root.path) else { return [] }
+            return try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey])
+                .filter { try UUID(uuidString: $0.lastPathComponent) != nil && $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true }
+        }
+        let accounts = try uuidDirectories(thirdPartySessionsRootURL)
+        if accounts.count == 1 {
+            let orgs = try uuidDirectories(accounts[0])
+            if orgs.count == 1 {
+                return ImportState(recordsByDestination: [destinationKey(orgs[0]): old.importedRecordNames])
+            }
+        }
+        return ImportState(unassignedLegacyRecords: old.importedRecordNames)
+    }
+
+    func writeImportState(_ state: ImportState) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         var data = try encoder.encode(state)
         data.append(0x0A)
         try atomicWrite(data, to: importStateURL)
+    }
+
+    // The menu and a second running switcher can otherwise each replace the
+    // other instance's ownership ledger while publishing different records.
+    func withImportLock<T>(_ operation: () throws -> T) throws -> T {
+        try FileManager.default.createDirectory(
+            at: importStateURL.deletingLastPathComponent(), withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let fd = open(importStateURL.path + ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { _ = close(fd) }
+        guard flock(fd, LOCK_EX) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        return try operation()
     }
 
     func removeImportState() throws {

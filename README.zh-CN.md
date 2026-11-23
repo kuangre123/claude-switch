@@ -60,7 +60,7 @@ xattr -dr com.apple.quarantine "$HOME/Applications/Claude Switch.app"
 2. 选择「自定义 API」或「Anthropic 官方」，填写地址、鉴权、密钥和可选的
    Fable/Opus/Sonnet/Haiku 模型 ID。官方 API Key 可以留空，此时沿用 Claude Code
    的登录/订阅。
-3. 在「切换范围」中决定是否勾选「同时切换 Claude Desktop，并自动重启」。
+3. 如果希望自定义 API 模式下的 Desktop **Code** 侧边栏显示最近的官方会话，在「切换范围」里同时勾选 Desktop 切换和显示官方本机 Code 会话。
 4. 点击窗口底部的「保存并切换」按钮；之后也可以通过菜单栏循环箭头快速切换。
 5. CLI 或 IDE 中新开一个 Claude Code 会话，或在原项目目录运行 `claude --continue`
    继续最近的对话。
@@ -82,16 +82,11 @@ Claude Desktop 的官方模式和第三方模式使用两个独立空间：
 - 切回官方模式时，会继续使用原来的官方登录与官方对话
 - 第三方模式的对话保存在本机的独立空间；不能跨两个模式继续同一条 Desktop 对话
 
-### 导入官方会话列表
+### 在第三方模式显示官方 Code 会话
 
-Desktop 把每条对话拆成两层存储：侧边栏渲染的**索引**位于
-`<数据根>/claude-code-sessions/<accountUuid>/<orgUuid>/local_*.json`，而对话
-**正文**一直在 `~/.claude/projects` 里。只有索引按模式隔离，所以第三方模式的侧边栏
-初始是空的——尽管所有正文都还在磁盘上。
+Desktop Code 为每个账号和组织单独保存侧边栏索引。开启导入后，每次切到自定义 API，Claude Switch 都会在 Desktop 读取列表之前补齐索引。已经在自定义 API 模式时，勾选后再次保存即可。
 
-勾选「把官方模式的会话列表导入第三方模式」后，应用会把这些索引记录复制过去，恢复
-侧边栏显示，正文一个字节都不动。已归档、已删除、或正文已不存在的记录会被跳过，
-避免侧边栏出现点不开的条目。
+此选项适用于正文位于本机共享目录 `~/.claude/projects` 的 Code 会话。已归档、已删除和缺少本机共享正文的记录会被跳过。官方 Chat 聊天记录请在官方模式的 Chat 标签页查看。
 
 导入是刻意设计为单向的（官方 → 第三方）。官方空间带有 `pending-uploads`
 上传队列，放进去的记录可能被同步到 Anthropic——经自定义网关产生的对话绝不能流入

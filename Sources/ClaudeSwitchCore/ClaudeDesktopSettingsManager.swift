@@ -287,7 +287,8 @@ public struct ClaudeDesktopSettingsManager: Sendable {
             let remainingIDs = Set(entries.compactMap {
                 ($0 as? [String: Any])?["id"] as? String
             })
-            if let state = try readSelectionState(), state.hadAppliedID {
+            let previousSelection = try readSelectionState()
+            if let state = previousSelection, state.hadAppliedID {
                 if let previousID = state.appliedID, remainingIDs.contains(previousID) {
                     root["appliedId"] = previousID
                 } else if let fallback = remainingIDs.sorted().first {
@@ -295,6 +296,9 @@ public struct ClaudeDesktopSettingsManager: Sendable {
                 } else {
                     root.removeValue(forKey: "appliedId")
                 }
+            } else if previousSelection == nil, remainingIDs.count == 1 {
+                // Older installs may have a managed profile but no saved selection.
+                root["appliedId"] = remainingIDs.first
             } else {
                 root.removeValue(forKey: "appliedId")
             }

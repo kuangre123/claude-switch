@@ -38,11 +38,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private enum SwitchCommitError: LocalizedError {
         case rollbackFailed(original: String, rollback: [String])
+        case desktopSwitchInProgress
 
         var errorDescription: String? {
             switch self {
             case let .rollbackFailed(original, rollback):
                 "切换失败：\(original)；恢复原配置时又遇到：\(rollback.joined(separator: "；"))"
+            case .desktopSwitchInProgress:
+                "请等本次 Claude Desktop 切换完成后再保存。"
             }
         }
     }
@@ -55,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var configuration = AppConfiguration()
     private var statusItem: NSStatusItem?
     private var settingsWindowController: SettingsWindowController?
+    private var desktopRestartTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
@@ -390,39 +394,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             configuration: configuration,
             credential: credential
         )
-        mirrorDesktopSessionIndexIfNeeded(for: profile, configuration: configuration)
     }
 
-    /// Copies the first-party Desktop session index into the third-party space
-    /// so the sidebar keeps listing earlier conversations.
-    ///
-    /// Only runs first-party to third-party: the first-party space syncs to
-    /// Anthropic via `pending-uploads`, so gateway conversations must not be
-    /// written into it. A failure here leaves the switch itself intact, since
-    /// the index is a convenience and every transcript stays in
-    /// `~/.claude/projects` either way.
-    private func mirrorDesktopSessionIndexIfNeeded(
-        for profile: ProfileID,
-        configuration: AppConfiguration
-    ) {
-        guard configuration.claudeDesktopSyncEnabled,
-              configuration.claudeDesktopSessionImportEnabled,
-              profile == .custom else {
-            return
-        }
+    private func importOfficialCodeSessions() async {
+        let mirror = desktopSessionIndexMirror
         do {
-            let summary = try desktopSessionIndexMirror.importOfficialSessions()
-            guard summary.imported > 0 || summary.missingTranscript > 0 else {
-                return
+            let summary = try await Task.detached(priority: .userInitiated) {
+                try mirror.importOfficialSessions()
+            }.value
+            var parts: [String] = []
+            if summary.imported > 0 {
+                parts.append("新增 \(summary.imported) 条")
             }
-            var message = "已导入 \(summary.imported) 条官方会话到第三方模式列表"
+            if summary.refreshed > 0 {
+                parts.append("更新 \(summary.refreshed) 条会话的排序")
+            }
+            if summary.alreadyPresent > 0 {
+                parts.append("已有 \(summary.alreadyPresent) 条")
+            }
             if summary.missingTranscript > 0 {
-                message += "；\(summary.missingTranscript) 条因正文已不存在被跳过"
+                parts.append("\(summary.missingTranscript) 条未找到本机正文")
             }
-            settingsWindowController?.showStatus(message)
+            if summary.unreadable > 0 {
+                parts.append("\(summary.unreadable) 条会话索引无法读取")
+            }
+            if summary.archivedOrDeleted > 0 {
+                parts.append("跳过已归档或删除的 \(summary.archivedOrDeleted) 条")
+            }
+            settingsWindowController?.showSessionImportStatus(parts.isEmpty
+                ? "本机未找到可导入的官方 Code 会话。"
+                : "官方 Code 会话：" + parts.joined(separator: "，") + "。")
+        } catch ClaudeDesktopSessionMirrorError.missingThirdPartyAccount {
+            settingsWindowController?.showSessionImportStatus(
+                "请先在自定义模式打开 Claude Desktop 的 Code 标签，再回到这里点击底部保存以导入会话。"
+            )
         } catch {
-            settingsWindowController?.showStatus(
-                "配置已切换；导入官方会话列表失败：\(error.localizedDescription)"
+            settingsWindowController?.showSessionImportStatus(
+                "导入官方 Code 会话失败。\(error.localizedDescription)"
             )
         }
     }
@@ -431,6 +439,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ updated: AppConfiguration,
         replacingCredentialsWith replacement: StoredCredentials? = nil
     ) throws {
+        guard desktopRestartTask == nil else {
+            throw SwitchCommitError.desktopSwitchInProgress
+        }
         let originalCredentials: StoredCredentials
         if replacement != nil {
             originalCredentials = StoredCredentials(
@@ -563,78 +574,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func restartClaudeDesktopIfNeeded() {
+        settingsWindowController?.showSessionImportStatus(nil)
         guard configuration.claudeDesktopSyncEnabled else {
             return
         }
-
-        let applications = NSRunningApplication.runningApplications(
-            withBundleIdentifier: Self.claudeDesktopBundleIdentifier
-        )
-        guard !applications.isEmpty else {
-            settingsWindowController?.showStatus(
-                "配置已应用；Claude Desktop 下次启动时生效"
+        let isCustom = configuration.activeProfile == .custom
+        let importSessions = isCustom && configuration.claudeDesktopSessionImportEnabled
+        if isCustom && !importSessions {
+            settingsWindowController?.showSessionImportStatus(
+                "本次未导入官方 Code 会话。要显示这些会话，请勾选上方选项并保存。"
             )
-            return
         }
-        guard let applicationURL = NSWorkspace.shared.urlForApplication(
-            withBundleIdentifier: Self.claudeDesktopBundleIdentifier
-        ) else {
-            settingsWindowController?.showStatus(
-                "配置已应用；请手动重启 Claude Desktop"
+        desktopRestartTask = Task {
+            defer { desktopRestartTask = nil }
+            let applications = NSRunningApplication.runningApplications(
+                withBundleIdentifier: Self.claudeDesktopBundleIdentifier
             )
-            return
-        }
-
-        settingsWindowController?.showStatus("配置已应用，正在重启 Claude Desktop…")
-        for application in applications {
-            _ = application.terminate()
-        }
-        waitForClaudeDesktopToQuit(
-            applications,
-            applicationURL: applicationURL,
-            remainingAttempts: 25
-        )
-    }
-
-    private func waitForClaudeDesktopToQuit(
-        _ applications: [NSRunningApplication],
-        applicationURL: URL,
-        remainingAttempts: Int
-    ) {
-        if applications.allSatisfy(\.isTerminated) {
-            let openConfiguration = NSWorkspace.OpenConfiguration()
-            openConfiguration.activates = true
-            NSWorkspace.shared.openApplication(
-                at: applicationURL,
-                configuration: openConfiguration
-            ) { [weak self] _, error in
-                Task { @MainActor in
-                    if let error {
-                        self?.settingsWindowController?.showStatus(
-                            "配置已应用，但重启失败：\(error.localizedDescription)"
-                        )
-                    } else {
-                        self?.settingsWindowController?.showStatus(
-                            "Claude Desktop 已按新配置重启"
-                        )
+            let applicationURL = applications.first?.bundleURL
+            if !applications.isEmpty {
+                settingsWindowController?.showStatus("配置已应用，正在退出 Claude Desktop…")
+                for application in applications {
+                    _ = application.terminate()
+                }
+                for _ in 0..<50 {
+                    if applications.allSatisfy(\.isTerminated) { break }
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
+                guard applications.allSatisfy(\.isTerminated) else {
+                    settingsWindowController?.showStatus("请退出 Claude Desktop 后再点击保存")
+                    if importSessions {
+                        settingsWindowController?.showSessionImportStatus("Claude Desktop 仍在运行，本次尚未导入官方 Code 会话。")
                     }
+                    return
                 }
             }
-            return
-        }
-
-        guard remainingAttempts > 0 else {
-            settingsWindowController?.showStatus(
-                "配置已应用；Claude Desktop 未能退出，请手动重启"
-            )
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.waitForClaudeDesktopToQuit(
-                applications,
-                applicationURL: applicationURL,
-                remainingAttempts: remainingAttempts - 1
-            )
+            // Desktop can flush the most recent Code index records on exit.
+            if importSessions { await importOfficialCodeSessions() }
+            guard !applications.isEmpty else {
+                settingsWindowController?.showStatus("配置已应用，Claude Desktop 下次启动时生效")
+                return
+            }
+            guard let url = applicationURL ?? NSWorkspace.shared.urlForApplication(
+                withBundleIdentifier: Self.claudeDesktopBundleIdentifier
+            ) else {
+                settingsWindowController?.showStatus("配置已应用，请打开 Claude Desktop")
+                return
+            }
+            do {
+                _ = try await NSWorkspace.shared.openApplication(
+                    at: url, configuration: NSWorkspace.OpenConfiguration()
+                )
+                settingsWindowController?.showStatus("Claude Desktop 已重新打开")
+            } catch {
+                settingsWindowController?.showStatus("请手动打开 Claude Desktop：\(error.localizedDescription)")
+            }
         }
     }
 }

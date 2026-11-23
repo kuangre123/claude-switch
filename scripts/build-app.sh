@@ -13,32 +13,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$build_dir/modules" "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULECACHE_PATH"
-
-swiftc \
-  -parse-as-library \
-  -whole-module-optimization \
-  -O \
-  -emit-module \
-  -emit-object \
-  -module-name ClaudeSwitchCore \
-  "$project_dir"/Sources/ClaudeSwitchCore/*.swift \
-  -framework Security \
-  -o "$build_dir/ClaudeSwitchCore.o" \
-  -emit-module-path "$build_dir/modules/ClaudeSwitchCore.swiftmodule"
-
-swiftc \
-  -parse-as-library \
-  -O \
-  "$project_dir"/Sources/ClaudeSwitch/*.swift \
-  "$build_dir/ClaudeSwitchCore.o" \
-  -I "$build_dir/modules" \
-  -framework AppKit \
-  -framework Security \
-  -o "$build_dir/ClaudeSwitch"
+minimum_macos=$(plutil -extract LSMinimumSystemVersion raw "$project_dir/Resources/Info.plist")
+for arch in arm64 x86_64; do
+  arch_dir="$build_dir/$arch"
+  mkdir -p "$arch_dir/modules"
+  swiftc -target "$arch-apple-macos$minimum_macos" \
+    -parse-as-library -whole-module-optimization -O -emit-module -emit-object \
+    -module-name ClaudeSwitchCore "$project_dir"/Sources/ClaudeSwitchCore/*.swift \
+    -framework Security -o "$arch_dir/ClaudeSwitchCore.o" \
+    -emit-module-path "$arch_dir/modules/ClaudeSwitchCore.swiftmodule"
+  swiftc -target "$arch-apple-macos$minimum_macos" \
+    -parse-as-library -O "$project_dir"/Sources/ClaudeSwitch/*.swift \
+    "$arch_dir/ClaudeSwitchCore.o" -I "$arch_dir/modules" \
+    -framework AppKit -framework Security -o "$arch_dir/ClaudeSwitch"
+done
 
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
-cp "$build_dir/ClaudeSwitch" "$app_dir/Contents/MacOS/ClaudeSwitch"
+lipo -create "$build_dir/arm64/ClaudeSwitch" "$build_dir/x86_64/ClaudeSwitch" \
+  -output "$app_dir/Contents/MacOS/ClaudeSwitch"
 cp "$project_dir/Resources/Info.plist" "$app_dir/Contents/Info.plist"
 cp "$project_dir/Resources/AppIcon.icns" "$app_dir/Contents/Resources/AppIcon.icns"
 chmod 755 "$app_dir/Contents/MacOS/ClaudeSwitch"

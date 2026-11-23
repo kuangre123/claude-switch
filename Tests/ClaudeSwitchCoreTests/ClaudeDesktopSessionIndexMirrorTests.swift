@@ -46,6 +46,87 @@ final class ClaudeDesktopSessionIndexMirrorTests: XCTestCase {
         XCTAssertFalse(fixture.thirdPartyHasRecord(session: "eeeeeeee"))
     }
 
+    func testLocallyDeletedCopyStaysDeletedAcrossImports() throws {
+        let fixture = try MirrorFixture()
+        defer { fixture.cleanup() }
+        try fixture.officialRecord(session: "once-visible", transcript: true)
+        let first = try fixture.mirror.importOfficialSessions()
+        XCTAssertEqual(first.imported, 1)
+        let folder = fixture.thirdPartyIndexDirectory
+        try FileManager.default.removeItem(at: folder.appendingPathComponent("local_once-visible.json"))
+        try Data().write(to: folder.appendingPathComponent("deleted_once-visible"))
+
+        XCTAssertEqual(try fixture.mirror.previewImportableSessions().archivedOrDeleted, 1)
+        XCTAssertEqual(try fixture.mirror.importOfficialSessions().imported, 0)
+        XCTAssertFalse(fixture.thirdPartyHasRecord(session: "once-visible"))
+    }
+
+    func testDamagedIndexDoesNotBlockNewerRecordsOrLoseImportOwnership() throws {
+        let fixture = try MirrorFixture()
+        defer { fixture.cleanup() }
+        for name in ["first", "invalid", "latest"] {
+            try fixture.officialRecord(session: name, transcript: true)
+        }
+        try Data("{".utf8).write(to: fixture.officialIndex.appendingPathComponent("local_invalid.json"))
+        let result = try fixture.mirror.importOfficialSessions()
+        XCTAssertEqual(result.imported, 2)
+        XCTAssertEqual(result.unreadable, 1)
+        XCTAssertTrue(fixture.thirdPartyHasRecord(session: "latest"))
+        XCTAssertEqual(try fixture.mirror.removeImportedSessions(), 2)
+    }
+
+    func testAmbiguousLegacyLedgerDoesNotClaimAThirdPartyNativeRecord() throws {
+        let fixture = try MirrorFixture()
+        defer { fixture.cleanup() }
+        let active = fixture.thirdPartyIndexDirectory
+        let stale = active.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: stale, withIntermediateDirectories: true)
+        try fixture.nativeThirdPartyRecord(session: "native")
+        let file = "local_native.json"
+        try Data("{}".utf8).write(to: stale.appendingPathComponent(file))
+        try JSONEncoder().encode(["importedRecordNames": [file]]).write(to: fixture.mirror.importStateURL)
+        try fixture.officialRecord(session: "recent", transcript: true)
+
+        XCTAssertEqual(try fixture.mirror.importOfficialSessions().imported, 1)
+        XCTAssertEqual(try fixture.mirror.removeImportedSessions(), 1)
+        XCTAssertTrue(fixture.thirdPartyHasRecord(session: "native"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stale.appendingPathComponent(file).path))
+    }
+
+    func testCorruptLedgerFailsWithoutClaimingOrCreatingRecords() throws {
+        let fixture = try MirrorFixture()
+        defer { fixture.cleanup() }
+        try fixture.officialRecord(session: "recent", transcript: true)
+        try Data("unexpected".utf8).write(to: fixture.mirror.importStateURL)
+        XCTAssertThrowsError(try fixture.mirror.importOfficialSessions())
+        XCTAssertFalse(fixture.thirdPartyHasRecord(session: "recent"))
+    }
+
+    func testNewerOfficialActivityRefreshesOnlyTheImportedCopyTimestamp() throws {
+        let fixture = try MirrorFixture()
+        defer { fixture.cleanup() }
+        try fixture.officialRecord(session: "updated", transcript: true, activity: 5)
+        try fixture.officialRecord(session: "native", transcript: true, activity: 60)
+        try fixture.nativeThirdPartyRecord(session: "native")
+        try fixture.mirror.importOfficialSessions()
+        let copy = fixture.thirdPartyIndexDirectory.appendingPathComponent("local_updated.json")
+        let native = fixture.thirdPartyIndexDirectory.appendingPathComponent("local_native.json")
+        let nativeBytes = try Data(contentsOf: native)
+        var local = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: copy)) as? [String: Any])
+        local["title"] = "renamed in third-party"
+        try JSONSerialization.data(withJSONObject: local).write(to: copy)
+        try fixture.officialRecord(session: "updated", transcript: true, activity: 100)
+        let preview = try fixture.mirror.previewImportableSessions()
+        XCTAssertEqual(preview.refreshed, 1)
+        let imported = try fixture.mirror.importOfficialSessions()
+        XCTAssertEqual(imported, preview)
+        let after = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: copy)) as? [String: Any])
+        XCTAssertEqual(after["title"] as? String, "renamed in third-party")
+        XCTAssertEqual(after["lastActivityAt"] as? Int, 100)
+        XCTAssertEqual(try Data(contentsOf: native), nativeBytes)
+        XCTAssertEqual(try fixture.mirror.importOfficialSessions().refreshed, 0)
+    }
+
     func testImportIsIdempotentAndRemovalSparesThirdPartySessions() throws {
         let fixture = try MirrorFixture()
         defer { fixture.cleanup() }
@@ -76,6 +157,9 @@ final class ClaudeDesktopSessionIndexMirrorTests: XCTestCase {
         defer { fixture.cleanup() }
 
         try fixture.officialRecord(session: "22222222", transcript: true)
+        let stale = fixture.thirdPartyIndexDirectory.deletingLastPathComponent()
+            .appendingPathComponent("00000000-0000-4000-8000-000000000000")
+        try FileManager.default.createDirectory(at: stale, withIntermediateDirectories: true)
         try fixture.mirror.importOfficialSessions()
 
         let expected = fixture.thirdPartyIndexDirectory
@@ -85,6 +169,26 @@ final class ClaudeDesktopSessionIndexMirrorTests: XCTestCase {
             expected.deletingLastPathComponent().lastPathComponent,
             ClaudeDesktopSessionIndexMirror.placeholderOrganizationID
         )
+    }
+
+    func testCurrentDeviceAndConfiguredOrganizationOverrideStaleIndexDirectories() throws {
+        let fixture = try MirrorFixture()
+        defer { fixture.cleanup() }
+        let root = fixture.mirror.thirdPartyRootURL
+        let device = UUID().uuidString.lowercased()
+        let organization = UUID().uuidString.lowercased()
+        let profile = UUID().uuidString.lowercased()
+        try Data(device.utf8).base64EncodedData().write(to: root.appendingPathComponent("ant-did"))
+        let library = root.appendingPathComponent("configLibrary")
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try JSONEncoder().encode(["appliedId": profile]).write(to: library.appendingPathComponent("_meta.json"))
+        try JSONEncoder().encode(["deploymentOrganizationUuid": organization])
+            .write(to: library.appendingPathComponent(profile + ".json"))
+        try fixture.officialRecord(session: "latest", transcript: true)
+        try fixture.mirror.importOfficialSessions()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root
+            .appendingPathComponent("claude-code-sessions/\(device)/\(organization)/local_latest.json").path))
+        XCTAssertFalse(fixture.thirdPartyHasRecord(session: "latest"))
     }
 
     func testImportFailsClearlyWhenThirdPartyAccountIsUnknown() throws {
@@ -126,7 +230,7 @@ private final class MirrorFixture {
     private let officialRoot: URL
     private let thirdPartyRoot: URL
     private let projects: URL
-    private let officialIndex: URL
+    let officialIndex: URL
 
     init(thirdPartyAccount: String? = MirrorFixture.thirdPartyAccountID) throws {
         let base = ProcessInfo.processInfo.environment["TMPDIR"]
@@ -174,11 +278,13 @@ private final class MirrorFixture {
     func officialRecord(
         session: String,
         transcript: Bool,
-        archived: Bool = false
+        archived: Bool = false,
+        activity: Int = 0
     ) throws {
         var record: [String: Any] = [
             "cliSessionId": session,
             "title": "session \(session)",
+            "lastActivityAt": activity,
             "cwd": "/Users/example/project"
         ]
         if archived {

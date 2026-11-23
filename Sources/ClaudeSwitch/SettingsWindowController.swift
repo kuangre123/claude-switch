@@ -50,11 +50,12 @@ final class SettingsWindowController:
     )
     private let desktopSyncDetail = NSTextField(wrappingLabelWithString: "")
     private let desktopSessionImportCheckbox = NSButton(
-        checkboxWithTitle: "把官方模式的会话列表导入第三方模式",
+        checkboxWithTitle: "切到自定义 API 时，显示官方账号的本机 Code 会话",
         target: nil,
         action: nil
     )
     private let desktopSessionImportDetail = NSTextField(wrappingLabelWithString: "")
+    private let desktopSessionImportResult = NSTextField(wrappingLabelWithString: "")
     private let fableModelField = NSTextField()
     private let sonnetModelField = NSTextField()
     private let opusModelField = NSTextField()
@@ -128,6 +129,12 @@ final class SettingsWindowController:
 
     func showStatus(_ message: String) {
         statusBadgeLabel.stringValue = message
+    }
+
+    func showSessionImportStatus(_ message: String?) {
+        desktopSessionImportResult.stringValue = message ?? ""
+        desktopSessionImportResult.isHidden = message == nil
+        desktopSessionImportDetail.isHidden = message != nil
     }
 
     private func configureFields(officialCredential: String, customCredential: String) {
@@ -459,23 +466,25 @@ final class SettingsWindowController:
         claudeCode.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         claudeCode.textColor = .secondaryLabelColor
 
-        desktopSessionImportDetail.stringValue = "Desktop 的会话列表按模式分开存放，"
-            + "勾选后切到自定义 API 时会把官方列表复制一份过去；对话正文本来就是共用的，不会被改动。"
-            + "只做官方到第三方这一个方向，避免网关对话进入会同步到 Anthropic 的官方空间。"
         desktopSessionImportDetail.font = NSFont.systemFont(ofSize: 11)
         desktopSessionImportDetail.textColor = .secondaryLabelColor
+        desktopSessionImportResult.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        desktopSessionImportResult.isHidden = true
 
         let controls = NSStackView(views: [
             claudeCode,
             desktopSyncCheckbox,
             desktopSyncDetail,
             desktopSessionImportCheckbox,
-            desktopSessionImportDetail
+            desktopSessionImportDetail,
+            desktopSessionImportResult
         ])
         controls.orientation = .vertical
         controls.alignment = .leading
         controls.spacing = 6
         controls.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        desktopSessionImportDetail.widthAnchor.constraint(equalTo: controls.widthAnchor).isActive = true
+        desktopSessionImportResult.widthAnchor.constraint(equalTo: controls.widthAnchor).isActive = true
 
         let row = NSStackView(views: [title, controls])
         row.orientation = .horizontal
@@ -600,8 +609,10 @@ final class SettingsWindowController:
     }
 
     private func buildVersionFooter() -> NSView {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let prefix = version.map { "v\($0)  ·  " } ?? ""
         let label = NSTextField(
-            labelWithString: "v1.3.0  ·  Claude Code：~/.claude  ·  Claude Desktop：独立官方 / 第三方空间"
+            labelWithString: "\(prefix)Claude Code：~/.claude  ·  Claude Desktop：独立官方 / 第三方空间"
         )
         label.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
         label.textColor = .tertiaryLabelColor
@@ -678,6 +689,7 @@ final class SettingsWindowController:
     }
 
     @objc private func providerChanged() {
+        showSessionImportStatus(nil)
         selectedProfile = providerControl.selectedSegment == 0 ? .custom : .official
         updateProviderEditor()
         markUnsaved()
@@ -689,6 +701,7 @@ final class SettingsWindowController:
     }
 
     @objc private func desktopSyncChanged() {
+        showSessionImportStatus(nil)
         let syncEnabled = desktopSyncCheckbox.state == .on
         desktopSessionImportCheckbox.isEnabled = syncEnabled
         if !syncEnabled {
@@ -699,6 +712,8 @@ final class SettingsWindowController:
     }
 
     @objc private func desktopSessionImportChanged() {
+        showSessionImportStatus(nil)
+        updateProviderEditor()
         markUnsaved()
     }
 
@@ -739,6 +754,13 @@ final class SettingsWindowController:
                 "使用 Claude Code 登录订阅，或配置 console.anthropic.com 创建的官方 API Key。"
         }
         let desktopEnabled = desktopSyncCheckbox.state == .on
+        if !desktopEnabled {
+            desktopSessionImportDetail.stringValue = "勾选「同时切换 Claude Desktop」后，可选择导入会话。"
+        } else if desktopSessionImportCheckbox.state == .on {
+            desktopSessionImportDetail.stringValue = "每次切到自定义 API，会从官方空间导入本机已保存的 Code 会话列表。官方 Chat 云端对话仍在官方空间查看。"
+        } else {
+            desktopSessionImportDetail.stringValue = "要在自定义模式看到官方最新的本机 Code 会话，请勾选上方选项并点击底部保存。"
+        }
         customKeyField.placeholderString = desktopEnabled && isCustom
             ? "Desktop 同步需要密钥；无鉴权服务请填写占位值"
             : "输入自定义 API 密钥；本地无鉴权可留空"

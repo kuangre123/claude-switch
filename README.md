@@ -72,8 +72,8 @@ launches it. To build without installing:
    authentication mode, credential, and optionally the Fable / Opus / Sonnet /
    Haiku model IDs. Leaving the official API key blank keeps using your existing
    Claude Code login or subscription.
-3. Under **Switch scope**, decide whether to also switch Claude Desktop and
-   restart it.
+3. To see recent official sessions in the custom provider’s Desktop **Code**
+   sidebar, enable both Desktop switching and the option to show official local Code sessions.
 4. Click **Save and switch**. After that, the circular-arrow menu bar item
    toggles between the two profiles.
 5. Start a new Claude Code session, or run `claude --continue` in the same
@@ -103,19 +103,17 @@ spaces.
 - Conversations created in third-party mode live in their own local space. You
   cannot continue the same Desktop conversation across the two modes.
 
-### Importing the official session list
+### Showing official Code sessions in third-party mode
 
-Desktop splits each conversation into two layers. The **index** the sidebar
-renders lives under
-`<data root>/claude-code-sessions/<accountUuid>/<orgUuid>/local_*.json`, while
-the **transcript** itself lives in `~/.claude/projects`. Only the index is
-partitioned per mode, so third-party mode starts with an empty sidebar even
-though every transcript is still on disk.
+Desktop Code keeps a separate sidebar index for each account and organization.
+When import is enabled, switching to the custom provider fills in missing entries
+before Desktop loads its sidebar. If the custom provider is already active, enable
+the option and save again.
 
-Enabling **Import the official session list into third-party mode** copies those
-index records across, restoring the sidebar without touching a single transcript.
-Records that are archived, deleted, or whose transcript no longer exists are
-skipped, so you do not end up with entries that cannot be opened.
+This option covers local Code sessions with transcripts in the shared
+`~/.claude/projects` directory. The importer skips archived or deleted records and
+records without a shared transcript. Official Chat history is available in the
+Chat tab in official mode.
 
 The copy is deliberately one-way, official to third-party. The official space
 owns `pending-uploads`, meaning records placed there can be synced to Anthropic —
